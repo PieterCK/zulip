@@ -2,13 +2,21 @@
 import re
 import string
 from collections.abc import Callable
+from typing import Any
+from urllib.parse import unquote, urlparse
 
+import requests
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.http import HttpRequest, HttpResponse
+from django.utils.translation import gettext as _
 
 from zerver.decorator import webhook_view
-from zerver.lib.exceptions import AnomalousWebhookPayloadError, UnsupportedWebhookEventTypeError
+from zerver.lib.exceptions import (
+    AnomalousWebhookPayloadError,
+    JsonableError,
+    UnsupportedWebhookEventTypeError,
+)
 from zerver.lib.response import json_success
 from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
 from zerver.lib.validator import WildValue, check_none_or, check_string
@@ -44,9 +52,11 @@ def guess_zulip_user_from_jira(jira_username: str, realm: Realm) -> UserProfile 
         return None
 
 
-def convert_jira_markup(content: str, realm: Realm) -> str:
+def convert_jira_markup(payload: WildValue, realm: Realm, auth: tuple[str, str] | None) -> str:
     # Attempt to do some simplistic conversion of Jira
     # formatting to Markdown, for consumption in Zulip
+
+    content = get_in(payload, ["comment", "body"]).tame(check_string)
 
     # Jira uses *word* for bold, we use **word**
     content = re.sub(r"\*([^\*]+)\*", r"**\1**", content)
@@ -78,21 +88,54 @@ def convert_jira_markup(content: str, realm: Realm) -> str:
     full_link_re = re.compile(r"\[(?:(?P<title>[^|~]+)\|)(?P<url>[^\]]*)\]")
     content = re.sub(full_link_re, r"[\g<title>](\g<url>)", content)
 
-    # Try to convert a Jira user mention of format [~username] into a
-    # Zulip user mention. We don't know the email, just the Jira username,
-    # so we naively guess at their Zulip account using this
-    mention_re = re.compile(r"\[~(.*?)\]")
-    for username in mention_re.findall(content):
-        # Try to look up username
-        user_profile = guess_zulip_user_from_jira(username, realm)
-        if user_profile:
-            replacement = f"**{user_profile.full_name}**"
-        else:
-            replacement = f"**{username}**"
+    # We replace mentioned account [~accountid:60e5a86a471e61006a4c51fd]
+    # with their corresponding usernames fetched by Jira API.
+    # https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-users
+    url = get_jira_api_url(payload, "rest/api/2/user")
+    if auth and url != "":
+        content = replace_account_ids_with_usernames(content, realm, url, auth)
 
-        content = content.replace(f"[~{username}]", replacement)
+    # Here's how Jira escapes special characters in their payload:
+    # ,.?\\!\n\"'\n\\[]\\{}()\n@#$%^&*\n~`|/\\\\
+    # for some reason, as of writing this, ! has two '\' before it.
+    content = content.replace("\\!", "!")
 
     return content
+
+
+def get_jira_api_url(payload: WildValue, jira_api_path: str) -> str:
+    url = get_in(payload, ["comment", "author", "self"]).tame(check_string)
+    return urlparse(url)._replace(path=jira_api_path, query="", fragment="").geturl()
+
+
+def get_jira_api_data(
+    jira_api_url: str, get_param: str, auth: tuple[str, str], **kwargs: Any
+) -> Any:
+    response = requests.get(jira_api_url, auth=auth, params=kwargs)
+    if response.status_code != requests.codes.ok:
+        raise JsonableError(_("Error accessing jira api."))
+    result = response.json()
+    return result[get_param]
+
+
+def replace_account_ids_with_usernames(
+    comment: str, realm: Realm, url: str, auth: tuple[str, str]
+) -> str:
+    pattern = re.compile(r"\[~accountid:([\w\-:]+)\]")
+
+    matches = list(pattern.finditer(comment))
+
+    for match in matches:
+        account_id = match.group(1)
+        username = get_jira_api_data(url, "displayName", auth, accountId=account_id)
+        # We also try to find the Zulip user corresponding to the mention Jira
+        # user. We don't know the email, just the Jira username, so we naively
+        # guess at their Zulip account using this
+        user_profile = guess_zulip_user_from_jira(username, realm)
+        if user_profile:
+            username = user_profile.full_name
+        comment = comment.replace(match.group(0), f"**{username}**")
+    return comment
 
 
 def get_in(payload: WildValue, keys: list[str], default: str = "") -> WildValue:
@@ -199,7 +242,9 @@ def add_change_info(
     return content
 
 
-def handle_updated_issue_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_updated_issue_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     # Reassigned, commented, reopened, and resolved events are all bundled
     # into this one 'updated' event type, so we try to extract the meaningful
     # event that happened
@@ -233,7 +278,7 @@ def handle_updated_issue_event(payload: WildValue, user_profile: UserProfile) ->
         content = f"{author} {verb} {issue}{assignee_blurb}"
         comment = get_in(payload, ["comment", "body"]).tame(check_string)
         if comment:
-            comment = convert_jira_markup(comment, user_profile.realm)
+            comment = convert_jira_markup(payload, user_profile.realm, auth)
             content = f"{content}:\n\n``` quote\n{comment}\n```"
         else:
             content = f"{content}."
@@ -272,7 +317,9 @@ def handle_updated_issue_event(payload: WildValue, user_profile: UserProfile) ->
     return content
 
 
-def handle_created_issue_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_created_issue_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     template = """
 {author} created {issue_string}:
 
@@ -290,7 +337,9 @@ def handle_created_issue_event(payload: WildValue, user_profile: UserProfile) ->
     )
 
 
-def handle_deleted_issue_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_deleted_issue_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     template = "{author} deleted {issue_string}{punctuation}"
     title = get_issue_title(payload)
     punctuation = "." if title[-1] not in string.punctuation else ""
@@ -301,42 +350,42 @@ def handle_deleted_issue_event(payload: WildValue, user_profile: UserProfile) ->
     )
 
 
-def normalize_comment(comment: str) -> str:
-    # Here's how Jira escapes special characters in their payload:
-    # ,.?\\!\n\"'\n\\[]\\{}()\n@#$%^&*\n~`|/\\\\
-    # for some reason, as of writing this, ! has two '\' before it.
-    normalized_comment = comment.replace("\\!", "!")
-    return normalized_comment
-
-
-def handle_comment_created_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_comment_created_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     return "{author} commented on {issue_string}\
 \n``` quote\n{comment}\n```\n".format(
         author=payload["comment"]["author"]["displayName"].tame(check_string),
         issue_string=get_issue_string(payload, with_title=True),
-        comment=normalize_comment(payload["comment"]["body"].tame(check_string)),
+        comment=convert_jira_markup(payload, user_profile.realm, auth),
     )
 
 
-def handle_comment_updated_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_comment_updated_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     return "{author} updated their comment on {issue_string}\
 \n``` quote\n{comment}\n```\n".format(
         author=payload["comment"]["author"]["displayName"].tame(check_string),
         issue_string=get_issue_string(payload, with_title=True),
-        comment=normalize_comment(payload["comment"]["body"].tame(check_string)),
+        comment=convert_jira_markup(payload, user_profile.realm, auth),
     )
 
 
-def handle_comment_deleted_event(payload: WildValue, user_profile: UserProfile) -> str:
+def handle_comment_deleted_event(
+    payload: WildValue, user_profile: UserProfile, auth: tuple[str, str] | None
+) -> str:
     return "{author} deleted their comment on {issue_string}\
 \n``` quote\n~~{comment}~~\n```\n".format(
         author=payload["comment"]["author"]["displayName"].tame(check_string),
         issue_string=get_issue_string(payload, with_title=True),
-        comment=normalize_comment(payload["comment"]["body"].tame(check_string)),
+        comment=convert_jira_markup(payload, user_profile.realm, auth),
     )
 
 
-JIRA_CONTENT_FUNCTION_MAPPER: dict[str, Callable[[WildValue, UserProfile], str] | None] = {
+JIRA_CONTENT_FUNCTION_MAPPER: dict[
+    str, Callable[[WildValue, UserProfile, tuple[str, str] | None], str] | None
+] = {
     "jira:issue_created": handle_created_issue_event,
     "jira:issue_deleted": handle_deleted_issue_event,
     "jira:issue_updated": handle_updated_issue_event,
@@ -355,6 +404,8 @@ def api_jira_webhook(
     user_profile: UserProfile,
     *,
     payload: JsonBodyPayload[WildValue],
+    jira_api_token: str | None = None,
+    email: str | None = None,
 ) -> HttpResponse:
     event = get_event_type(payload)
     if event in IGNORED_EVENTS:
@@ -369,8 +420,16 @@ def api_jira_webhook(
     if content_func is None:
         raise UnsupportedWebhookEventTypeError(event)
 
+    auth = None
+
+    if email and jira_api_token is not None:
+        # Config options encode parameters using Jira's internal encoding,
+        # causing double encoding. To address this, we decode the parameters
+        # to remove the extra layer of encoding.
+        auth = (unquote(email), unquote(jira_api_token))
+
     topic_name = get_issue_topic(payload)
-    content: str = content_func(payload, user_profile)
+    content: str = content_func(payload, user_profile, auth)
 
     check_send_webhook_message(
         request, user_profile, topic_name, content, event, unquote_url_parameters=True
