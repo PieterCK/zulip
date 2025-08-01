@@ -39,6 +39,16 @@
     gap: 0 0.625em; /* 10px at 16px/1em */
 }
 
+#draft_overlay_banner_container {
+    .banner-content {
+        justify-content: center;
+        flex-wrap: nowrap;
+    }
+    .banner-label {
+        /* Reset to initial value */
+        flex: 0 1 auto;
+    }
+}
 .banner-label {
     /* We allow the banner label to grow and shrink, and set
        the flex basis to 60% of the query container's width.
